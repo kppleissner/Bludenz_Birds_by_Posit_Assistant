@@ -1,0 +1,258 @@
+---
+title: "eBird Analysis — Bludenz, Suchardstraße 5"
+subtitle: "Patch checklist data, December 2016 – October 2025"
+author: "Posit Assistant"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    fig-width: 8
+    fig-height: 5
+    theme: cosmo
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+## Overview
+
+This report analyses a personal eBird "My eBird Data" export for a single
+location — **Bludenz, Suchardstraße 5** (47.16 °N, 9.82 °E), Vorarlberg,
+Austria. The data are garden/patch checklists spanning December 2016 to
+October 2025.
+
+The eBird taxonomy from the [`auk`](https://cornelllabofornithology.github.io/auk/)
+package is used to attach family and order to every species.
+
+```{r setup}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(stringr)
+library(forcats)
+library(ggplot2)
+library(scales)
+library(auk)
+
+theme_set(theme_minimal(base_size = 12))
+
+path <- "BludenzSuchardstr5_bisOkt19_2025-corrected.xlsx"
+```
+
+## Load and clean
+
+The raw export needs three fixes: the latitude/longitude are stored as
+integers scaled by 10^7^, the `Time` column carries a spurious 1899 date, and
+useful temporal fields (year, month, hour) are derived for the analysis.
+
+```{r clean}
+raw <- read_excel(path, sheet = "bisOkt19_2025")
+
+birds <- raw |>
+  mutate(
+    latitude     = Latitude / 1e7,
+    longitude    = Longitude / 1e7,
+    date         = as_date(Date),
+    year         = year(date),
+    month        = month(date, label = TRUE),
+    hour         = hour(Time),
+    duration_min = `Duration (Min)`,
+    count_num    = suppressWarnings(as.numeric(Count))
+  )
+
+# Attach family / order from the auk eBird taxonomy
+tax <- ebird_taxonomy |>
+  select(scientific_name, family, order)
+
+birds <- birds |>
+  left_join(tax, by = c("Scientific Name" = "scientific_name"))
+```
+
+```{r overview-stats}
+tibble(
+  Metric = c("Observations", "Checklists", "Species", "Families",
+             "Orders", "First date", "Last date"),
+  Value = c(
+    format(nrow(birds), big.mark = ","),
+    format(n_distinct(birds$`Submission ID`), big.mark = ","),
+    as.character(n_distinct(birds$`Common Name`)),
+    as.character(n_distinct(birds$family)),
+    as.character(n_distinct(birds$order)),
+    as.character(min(birds$date)),
+    as.character(max(birds$date))
+  )
+) |>
+  knitr::kable()
+```
+
+## Sampling effort
+
+Effort at a patch shapes everything else, so we look at it first. Checklists
+are unevenly distributed across the study period, ramping up sharply from 2020
+onward.
+
+```{r effort-year}
+birds |>
+  distinct(`Submission ID`, year) |>
+  count(year) |>
+  ggplot(aes(factor(year), n)) +
+  geom_col() +
+  labs(title = "Checklists per year", x = NULL, y = "Checklists")
+```
+
+```{r effort-heatmap, fig.height=5.5}
+effort <- birds |>
+  distinct(`Submission ID`, year, month) |>
+  count(year, month)
+
+ggplot(effort, aes(month, factor(year), fill = n)) +
+  geom_tile(color = "white") +
+  scale_fill_viridis_c(option = "C", name = "Checklists") +
+  labs(title = "Sampling effort: checklists per month and year",
+       x = NULL, y = NULL)
+```
+
+The heatmap shows the recording history is far from balanced — some months in
+early years have no checklists at all, so between-year comparisons should be
+read with effort in mind.
+
+## Checklist-level distributions
+
+```{r checklist-table}
+checklists <- birds |>
+  group_by(`Submission ID`) |>
+  summarise(
+    date = first(date), year = first(year), month = first(month),
+    hour = first(hour), duration_min = first(duration_min),
+    protocol = first(Protocol), n_species = n_distinct(`Common Name`),
+    .groups = "drop"
+  )
+```
+
+### Duration
+
+Most checklists are short stationary counts; durations above ~4 hours are rare
+and truncated here for readability.
+
+```{r hist-duration}
+checklists |>
+  filter(!is.na(duration_min), duration_min <= 240) |>
+  ggplot(aes(duration_min)) +
+  geom_histogram(binwidth = 10, boundary = 0) +
+  labs(title = "Checklist duration", x = "Duration (min)", y = "Checklists")
+```
+
+### Start hour
+
+Recording concentrates in the morning, peaking around 08:00–10:00.
+
+```{r hist-hour}
+checklists |>
+  filter(!is.na(hour)) |>
+  ggplot(aes(hour)) +
+  geom_histogram(binwidth = 1, boundary = 0) +
+  labs(title = "Checklist start hour", x = "Hour of day", y = "Checklists")
+```
+
+### Species richness per checklist
+
+```{r hist-richness}
+ggplot(checklists, aes(n_species)) +
+  geom_histogram(binwidth = 1, boundary = 0) +
+  labs(title = "Species richness per checklist",
+       x = "Species per checklist", y = "Checklists")
+```
+
+## Species composition
+
+Detection frequency is expressed as the share of checklists in which a species
+was recorded — a more effort-robust measure than raw counts.
+
+```{r sp-freq}
+n_cl <- n_distinct(birds$`Submission ID`)
+
+sp_freq <- birds |>
+  distinct(`Submission ID`, `Common Name`) |>
+  count(`Common Name`, name = "checklists") |>
+  mutate(freq = checklists / n_cl) |>
+  arrange(desc(checklists))
+
+sp_freq |>
+  slice_head(n = 25) |>
+  mutate(`Common Name` = fct_reorder(`Common Name`, freq)) |>
+  ggplot(aes(freq, `Common Name`)) +
+  geom_col() +
+  scale_x_continuous(labels = percent) +
+  labs(title = "25 most frequently detected species",
+       x = "Detection frequency (share of checklists)", y = NULL)
+```
+
+### Species per family
+
+```{r family-comp, fig.height=5.5}
+birds |>
+  distinct(`Common Name`, family) |>
+  count(family, name = "species") |>
+  filter(species >= 2) |>
+  mutate(family = fct_reorder(family, species)) |>
+  ggplot(aes(species, family)) +
+  geom_col() +
+  labs(title = "Species richness per family (families with >= 2 species)",
+       x = "Species", y = NULL)
+```
+
+## Seasonality
+
+The seasonal heatmap of the 20 most frequent species divides residents (present
+year-round) from summer visitors that arrive on migration.
+
+```{r seasonality-heatmap, fig.height=6}
+top20 <- sp_freq |> slice_head(n = 20) |> pull(`Common Name`)
+
+n_cl_month <- birds |>
+  distinct(`Submission ID`, month) |>
+  count(month, name = "n_cl")
+
+season <- birds |>
+  filter(`Common Name` %in% top20) |>
+  distinct(`Submission ID`, `Common Name`, month) |>
+  count(`Common Name`, month, name = "detections") |>
+  left_join(n_cl_month, by = "month") |>
+  mutate(
+    freq = detections / n_cl,
+    `Common Name` = factor(`Common Name`, levels = rev(top20))
+  )
+
+ggplot(season, aes(month, `Common Name`, fill = freq)) +
+  geom_tile(color = "white") +
+  scale_fill_viridis_c(option = "D", name = "Detection\nfrequency",
+                       labels = percent) +
+  labs(title = "Seasonal detection frequency of the 20 most frequent species",
+       x = NULL, y = NULL)
+```
+
+Species such as *Mönchsgrasmücke* (Blackcap), *Zilpzalp* (Chiffchaff),
+*Mauersegler* (Common Swift) and *Rauchschwalbe* (Barn Swallow) are effectively
+absent in winter and peak in the breeding season — the classic signature of
+long-distance migrants — whereas *Haussperling*, *Amsel* and *Kohlmeise* are
+detected consistently across all months.
+
+## Notes and caveats
+
+- **Effort is uneven** across years and months; interpret trends cautiously.
+- Detection frequency depends on both true abundance and detectability.
+- Common names are in **German** as exported from eBird; scientific names and
+  the `auk` taxonomy provide the language-neutral link.
+- This is a single-location dataset, so results describe one patch and should
+  not be generalised.
+
+## Session information
+
+```{r session-info}
+sessionInfo()
+```
